@@ -1,0 +1,87 @@
+name: iamlab
+
+networks:
+  iamlab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
+          gateway: 172.30.10.1
+
+volumes:
+  dc1-samba-lib:
+  dc1-samba-etc:
+  ip1-tmp:
+  hris-db-data:
+  hris-app:
+
+services:
+  dc1:
+    build: ./dc1
+    image: iamlab/samba-dc:local
+    container_name: dc1
+    hostname: dc1
+    domainname: lab.internal
+    init: true
+    restart: unless-stopped
+    cap_add: [SYS_ADMIN]
+    env_file: ./dc1/dc1.env
+    networks:
+      iamlab:
+        ipv4_address: 172.30.10.10
+    volumes:
+      - dc1-samba-lib:/var/lib/samba
+      - dc1-samba-etc:/etc/samba
+    ports:
+      - "127.0.0.1:389:389"
+      - "127.0.0.1:636:636"
+
+  ip1:
+    image: public.ecr.aws/veza/insight_point:latest
+    container_name: ip1
+    hostname: ip1
+    domainname: lab.internal
+    restart: unless-stopped
+    depends_on: [dc1]
+    dns: [172.30.10.10]
+    dns_search: [lab.internal]
+    env_file: ./ip1/ip1.env
+    networks:
+      iamlab:
+        ipv4_address: 172.30.10.20
+    volumes:
+      - ip1-tmp:/tmp
+      - ./ip1/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+
+  hris-db:
+    image: mariadb:10.11
+    container_name: hris-db
+    hostname: hris-db
+    domainname: lab.internal
+    restart: unless-stopped
+    env_file: ./hris/hris-db.env
+    dns: [172.30.10.10]
+    dns_search: [lab.internal]
+    networks:
+      iamlab:
+        ipv4_address: 172.30.10.30
+    volumes:
+      - hris-db-data:/var/lib/mysql
+
+  hris:
+    image: orangehrm/orangehrm:latest
+    platform: linux/amd64
+    container_name: hris
+    hostname: hris
+    domainname: lab.internal
+    restart: unless-stopped
+    depends_on: [hris-db]
+    dns: [172.30.10.10]
+    dns_search: [lab.internal]
+    networks:
+      iamlab:
+        ipv4_address: 172.30.10.31
+    volumes:
+      - hris-app:/var/www/html
+    ports:
+      - "127.0.0.1:8080:80"
