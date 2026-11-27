@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-OrangeHRM -> Veza OAA connector (Custom HRIS template)
+OrangeHRM -> Veza OAA connector (Custom HRIS template) with Lifecycle Management write-back
 
 Pulls employees and org subunits from the OrangeHRM 5.x REST API (v2) and
 pushes them to Veza as a Custom HRIS provider ("hris" template).
 
-Auth note: OrangeHRM 5.x supports only the OAuth2 Authorization Code grant
-with PKCE (no client_credentials). Run `auth` once interactively to get a
-refresh token; `sync` then runs headless and refreshes as needed.
-The token inherits the consenting user's role, so consent as an Admin.
+Write-back: Veza LCM cannot authenticate to OrangeHRM itself (OrangeHRM 5.x only
+supports OAuth2 Authorization Code + PKCE; Veza REST credentials support client
+credentials / password grant only). So `serve` runs a small endpoint that holds the
+OrangeHRM refresh token. A Veza LCM "Send REST Payload" action, routed through an
+Insight Point, calls it to set an employee's work email in OrangeHRM.
+
+Auth note: run `auth` once interactively to get a refresh token; `sync` and `serve`
+then run headless and refresh as needed. The token inherits the consenting user's
+role, so consent as an Admin.
 
 Setup:
   pip install oaaclient requests
@@ -24,17 +29,41 @@ Setup:
   export VEZA_API_KEY=<veza api key>
   python orangehrm_veza.py sync --dry-run --save-json payload.json   # inspect first
   python orangehrm_veza.py sync                                      # push
+
+Write-back setup:
+  # 1. One-time: create the Send REST Payload provider/data source (Insight Point ID is
+  #    under Integrations > Insight Points in Veza)
+  export VEZA_INSIGHT_POINT_ID=<uuid>
+  python orangehrm_veza.py setup-writeback
+
+  # 2. Run the endpoint (container on the lab network, token file mounted read-write)
+  export WRITEBACK_TOKEN=$(python -c 'import secrets;print(secrets.token_urlsafe(32))')
+  python orangehrm_veza.py serve [--cert cert.pem --key key.pem]
+
+  # 3. Test
+  curl -X PUT http://localhost:8780/employee-id/0001/work-email \
+       -H "Authorization: Bearer $WRITEBACK_TOKEN" -H "Content-Type: application/json" \
+       -d '{"email":"test.user@lab.local"}'
+
+  # 4. In Veza: Bearer credential holding WRITEBACK_TOKEN; Send REST Payload action after
+  #    the AD Provision Account step: Data Source = write-back data source, PUT,
+  #    URL .../employee-id/{employee_number}/work-email,
+  #    payload {"email": "{ActiveDirectoryUser.email}"}
 """
 
 import argparse
 import base64
 import hashlib
+import hmac
 import http.server
 import json
 import logging
 import os
+import re
 import secrets
+import ssl
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -186,6 +215,22 @@ class OrangeHRMClient:
             break
         r.raise_for_status()
         return r.json()
+
+    def put(self, path, body):
+        """PUT JSON; returns the response (not raised) so callers can pass validation errors back."""
+        r = None
+        for attempt in range(4):
+            r = self.s.put(f"{self.api}{path}", json=body, timeout=60, verify=self.auth.verify,
+                           headers={"Authorization": f"Bearer {self.auth.access_token()}",
+                                    "Accept": "application/json"})
+            if r.status_code == 401 and attempt == 0:
+                self.auth.refresh()
+                continue
+            if r.status_code in (429, 502, 503, 504):
+                time.sleep(2 ** attempt)
+                continue
+            break
+        return r
 
     def safe_get(self, path, params=None):
         try:
@@ -461,10 +506,147 @@ def push_to_veza(payload, provider_name, data_source_name, provisioning=True):
 
 
 # --------------------------------------------------------------------------
+# LCM write-back: provider setup + endpoint called by Veza Send REST Payload
+# --------------------------------------------------------------------------
+EMAIL_RE = re.compile(r"^[^@\s{}]+@[^@\s{}]+\.[^@\s{}]+$")  # also rejects unresolved {placeholders}
+CONTACT_PUT_FIELDS = ("street1", "street2", "city", "province", "zipCode", "countryCode",
+                      "homeTelephone", "workTelephone", "mobile", "workEmail", "otherEmail")
+_write_lock = threading.Lock()
+
+
+def setup_writeback(provider_name, data_source_name, insight_point_id):
+    """Create the application-template provider that gives LCM a Data Source routed via the
+    Insight Point (external_lifecycle_management_type=SEND_REST_PAYLOAD). Separate from the
+    HRIS provider; data_plane_id is set at creation and cannot be changed afterwards."""
+    from oaaclient.client import OAAClient
+    from oaaclient.templates import CustomApplication
+
+    veza_url = env("VEZA_URL").rstrip("/")
+    if not veza_url.startswith(("http://", "https://")):
+        veza_url = "https://" + veza_url
+    api_key = env("VEZA_API_KEY")
+    veza = OAAClient(url=veza_url, token=api_key)
+
+    if veza.get_provider(provider_name):
+        log.info("Provider '%s' exists; data_plane_id can't be changed (delete/recreate to move it)",
+                 provider_name)
+    else:
+        r = requests.post(f"{veza_url}/api/v1/providers/custom",
+                          headers={"authorization": f"Bearer {api_key}",
+                                   "Content-Type": "application/json"},
+                          json={"name": provider_name, "custom_template": "application",
+                                "provisioning": True,
+                                "external_lifecycle_management_type": "SEND_REST_PAYLOAD",
+                                "data_plane_id": insight_point_id},
+                          timeout=30)
+        if r.status_code >= 400:
+            sys.exit(f"Creating write-back provider failed ({r.status_code}): {r.text}")
+        log.info("Created provider '%s' (SEND_REST_PAYLOAD)", provider_name)
+
+    # The data source only appears in the LCM action's Data Source dropdown once a payload is pushed.
+    app = CustomApplication(name=provider_name, application_type="OrangeHRM Write-Back")
+    app.add_local_user("orangehrm-writeback")
+    veza.push_application(provider_name=provider_name, data_source_name=data_source_name,
+                          application_object=app)
+    log.info("Data source '%s' ready; select it in the Send REST Payload action", data_source_name)
+
+
+def contact_put_body(current, work_email):
+    """Assumes PUT replaces the whole contact record, so carry existing fields through.
+    VERIFY field names against a DevTools capture of the OrangeHRM UI's Contact Details save."""
+    body = {k: current.get(k) for k in CONTACT_PUT_FIELDS if k in current}
+    country = current.get("country")
+    if isinstance(country, dict) and country.get("countryCode"):
+        body["countryCode"] = country["countryCode"]
+    body["workEmail"] = work_email
+    return body
+
+
+def resolve_emp_number(client, employee_id):
+    """HR-visible employee ID -> empNumber. nameOrId is a partial match, so require an exact hit."""
+    for e in client.paged("/pim/employees", {"nameOrId": employee_id, "includeEmployees": "onlyCurrent"}):
+        if str(e.get("employeeId")) == str(employee_id):
+            return e["empNumber"]
+    return None
+
+
+def set_work_email(client, emp_number, email, overwrite=False):
+    path = f"/pim/employee/{emp_number}/contact-details"
+    with _write_lock:  # also serializes token refreshes
+        current = client.get(path).get("data") or {}
+        existing = (current.get("workEmail") or "").strip()
+        if existing.lower() == email.lower():
+            return 200, {"changed": False, "reason": "already_set"}
+        if existing and not overwrite:
+            log.warning("empNumber %s already has work email %s; keeping it", emp_number, existing)
+            return 200, {"changed": False, "reason": "existing_email_kept"}
+        r = client.put(path, contact_put_body(current, email))
+    if r.status_code >= 400:
+        return 502, {"changed": False, "reason": "orangehrm_rejected",
+                     "status": r.status_code, "detail": r.text[:500]}
+    return 200, {"changed": True}
+
+
+def make_handler(client, secret):
+    route = re.compile(r"^/(emp-number|employee-id)/([^/]+)/work-email$")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _reply(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_PUT(self):
+            supplied = self.headers.get("Authorization", "")
+            if not hmac.compare_digest(supplied.encode(), f"Bearer {secret}".encode()):
+                return self._reply(401, {"error": "unauthorized"})
+            m = route.match(urllib.parse.urlparse(self.path).path)
+            if not m:
+                return self._reply(404, {"error": "not found"})
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return self._reply(400, {"error": "invalid JSON"})
+            email = str(body.get("email", "")).strip().lower()
+            if not EMAIL_RE.match(email):
+                return self._reply(400, {"error": f"invalid email: {email!r}"})
+            kind, ref = m.group(1), urllib.parse.unquote(m.group(2))
+            try:
+                emp = int(ref) if kind == "emp-number" else resolve_emp_number(client, ref)
+                if emp is None:
+                    return self._reply(404, {"error": f"no current employee with ID {ref}"})
+                code, out = set_work_email(client, emp, email, bool(body.get("overwrite")))
+            except (requests.RequestException, SystemExit, ValueError) as e:
+                log.error("Write-back for %s failed: %s", ref, e)
+                return self._reply(502, {"error": str(e)})
+            log.info("%s -> %s %s", self.path, code, out)
+            self._reply(code, out)
+
+        def log_message(self, fmt, *args):
+            log.debug(fmt, *args)
+
+    return Handler
+
+
+def serve(client, host, port, secret, cert=None, key=None):
+    srv = http.server.ThreadingHTTPServer((host, port), make_handler(client, secret))
+    if cert and key:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    log.info("Write-back endpoint listening on %s:%d (%s)", host, port, "TLS" if cert else "plain HTTP")
+    srv.serve_forever()
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="OrangeHRM -> Veza OAA HRIS connector")
+    ap = argparse.ArgumentParser(description="OrangeHRM -> Veza OAA HRIS connector with LCM write-back")
     ap.add_argument("--token-file", default=os.getenv("ORANGEHRM_TOKEN_FILE", TOKEN_FILE_DEFAULT))
     ap.add_argument("--insecure", action="store_true", help="Skip TLS verification to OrangeHRM (lab only)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -488,9 +670,26 @@ def main():
     sp.add_argument("--save-json", help="Write the OAA payload to this file")
     sp.add_argument("--dry-run", action="store_true", help="Build payload but do not push")
 
+    sv = sub.add_parser("serve", help="Run the write-back endpoint that Veza LCM calls")
+    sv.add_argument("--host", default=os.getenv("WRITEBACK_HOST", "0.0.0.0"))
+    sv.add_argument("--port", type=int, default=int(os.getenv("WRITEBACK_PORT", "8780")))
+    sv.add_argument("--cert", help="TLS certificate (PEM)")
+    sv.add_argument("--key", help="TLS private key (PEM)")
+
+    sw = sub.add_parser("setup-writeback", help="Create the Veza provider/data source for LCM write-back")
+    sw.add_argument("--provider", default="OrangeHRM Write-Back")
+    sw.add_argument("--datasource", default="OrangeHRM Write-Back")
+    sw.add_argument("--insight-point-id", default=os.getenv("VEZA_INSIGHT_POINT_ID"))
+
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.cmd == "setup-writeback":  # needs no OrangeHRM auth
+        if not args.insight_point_id:
+            sys.exit("Provide --insight-point-id or VEZA_INSIGHT_POINT_ID")
+        setup_writeback(args.provider, args.datasource, args.insight_point_id)
+        return
 
     base_url = env("ORANGEHRM_URL").rstrip("/")
     auth = OrangeHRMAuth(base_url, env("ORANGEHRM_CLIENT_ID"), env("ORANGEHRM_REDIRECT_URI"),
@@ -501,6 +700,15 @@ def main():
         return
 
     client = OrangeHRMClient(auth)
+
+    if args.cmd == "serve":
+        secret = env("WRITEBACK_TOKEN")
+        if len(secret) < 32:
+            sys.exit("WRITEBACK_TOKEN must be at least 32 characters "
+                     "(python -c 'import secrets;print(secrets.token_urlsafe(32))')")
+        serve(client, args.host, args.port, secret, args.cert, args.key)
+        return
+
     emps = fetch_employees(client, include_past=not args.current_only, details=not args.no_details)
     subunits = fetch_subunits(client)
     payload = build_payload(emps, subunits, base_url, args.system_name, args.idp_type)
